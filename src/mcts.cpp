@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "mcts.h"
 #include "process.h"
+#include <omp.h>
 
 namespace coacd
 {
@@ -847,22 +848,86 @@ namespace coacd
 
     Node *MonteCarloTreeSearch(Params &params, Node *node, vector<Plane> &best_path)
     {
+        // 在代码中直接设置线程数为4，这会覆盖环境变量中的设置
+        omp_set_num_threads(32);
+        
         int computation_budget = params.mcts_iteration;
         Model initial_mesh = node->get_state()->current_parts[0].current_mesh, initial_ch;
         initial_mesh.ComputeAPX(initial_ch);
         double cost = ComputeRv(initial_mesh, initial_ch, params.rv_k) / params.mcts_max_depth;
         vector<Plane> current_path;
-
-        for (int i = 0; i < computation_budget; i++)
-        {
-            current_path.clear();
-            bool flag = false;
-            Node *expand_node = tree_policy(node, cost, flag);
-            double reward = default_policy(expand_node, params, current_path);
-            backup(expand_node, reward, current_path, best_path);
+        
+        // 只有迭代次数足够多才并行化，否则顺序执行
+        if (computation_budget >= 16) {
+            // 获取可用线程数，小问题使用较少线程
+            int num_threads = omp_get_max_threads();
+            int iterations_per_thread = computation_budget / num_threads;
+            
+            // 创建线程本地副本
+            vector<vector<Plane>> thread_best_paths(num_threads);
+            vector<double> thread_best_rewards(num_threads, INF);
+            
+            #pragma omp parallel num_threads(num_threads)
+            {
+                int thread_id = omp_get_thread_num();
+                vector<Plane> local_current_path;
+                double local_best_reward = INF;
+                Node* local_best_node = nullptr;
+                
+                // 每个线程独立执行一部分迭代
+                for (int i = 0; i < iterations_per_thread; ++i) {
+                    local_current_path.clear();
+                    bool flag = false;
+                    Node *expand_node = tree_policy(node, cost, flag);
+                    double reward = default_policy(expand_node, params, local_current_path);
+                    
+                    // 本地更新，不需要临界区
+                    if (reward < local_best_reward) {
+                        local_best_reward = reward;
+                        thread_best_paths[thread_id] = local_current_path;
+                        if (!local_best_node || reward < local_best_node->get_quality_value()) {
+                            local_best_node = expand_node;
+                        }
+                    }
+                    
+                    // 只在线程内部更新节点统计信息
+                    vector<Plane> tmp_best_path;
+                    backup(expand_node, reward, local_current_path, tmp_best_path);
+                }
+                
+                // 只为最好的结果添加一次到共享数据中
+                #pragma omp critical
+                {
+                    thread_best_rewards[thread_id] = local_best_reward;
+                }
+            }
+            
+            // 合并所有线程的结果，找到全局最优
+            double global_best_reward = thread_best_rewards[0];
+            int best_thread_id = 0;
+            for (int i = 1; i < num_threads; ++i) {
+                if (thread_best_rewards[i] < global_best_reward) {
+                    global_best_reward = thread_best_rewards[i];
+                    best_thread_id = i;
+                }
+            }
+            
+            // 使用最好的线程结果
+            best_path = thread_best_paths[best_thread_id];
+        } 
+        else {
+            // 小规模问题使用原始的顺序执行
+            for (int i = 0; i < computation_budget; i++)
+            {
+                current_path.clear();
+                bool flag = false;
+                Node *expand_node = tree_policy(node, cost, flag);
+                double reward = default_policy(expand_node, params, current_path);
+                backup(expand_node, reward, current_path, best_path);
+            }
         }
+        
         Node *best_next_node = best_child(node, false);
-
         return best_next_node;
     }
 }

@@ -64,11 +64,6 @@ if(WITH_3RD_PARTY_LIBS)
     target_link_libraries(coacd PRIVATE openvdb_static spdlog::spdlog)
 endif()
 
-find_package(OpenMP)
-if (OpenMP_CXX_FOUND)
-    target_link_libraries(coacd PUBLIC OpenMP::OpenMP_CXX)
-endif()
-
 find_package(Threads)
 target_link_libraries(coacd PRIVATE Threads::Threads)
 set_target_properties(coacd PROPERTIES POSITION_INDEPENDENT_CODE TRUE)
@@ -87,4 +82,18 @@ if(WITH_3RD_PARTY_LIBS)
     target_link_libraries(main coacd spdlog::spdlog openvdb_static)
 else()
     target_link_libraries(main coacd)
+endif()
+
+# 查找并启用OpenMP
+find_package(OpenMP REQUIRED)
+if(OpenMP_CXX_FOUND)
+    # 为所有目标添加OpenMP支持
+    target_link_libraries(coacd PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(_coacd PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(main OpenMP::OpenMP_CXX)
+    # 为C++代码添加OpenMP编译标志
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+    message(STATUS "OpenMP found and enabled")
+else()
+    message(FATAL_ERROR "OpenMP is required but not found!")
 endif()
