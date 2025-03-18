@@ -99,4 +99,7 @@ namespace coacd
     void WritePointSet(const string &fileName, vector<vec3d> &samples);
     void MergeMesh(Model &mesh1, Model &mesh2, Model &merge);
 
+    void GenerateRandomColor(float &r, float &g, float &b);
+    void SaveColoredOBJ(string filename, vector<Model> &parts, Params &params);
+
 }

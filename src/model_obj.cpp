@@ -681,18 +681,79 @@ namespace coacd
         triangles.clear();
     }
 
-    void Model::SaveOBJ(const string &filename)
-    {
-        std::ofstream os(filename);
-        for (int i = 0; i < (int)points.size(); ++i)
-        {
-            os << "v " << points[i][0] << " " << points[i][1] << " " << points[i][2] << "\n";
+    // 首先定义 GenerateRandomColor 函数
+    void GenerateRandomColor(float &r, float &g, float &b) {
+        r = (float)rand() / RAND_MAX;
+        g = (float)rand() / RAND_MAX;
+        b = (float)rand() / RAND_MAX;
+    }
+
+    // 然后定义 SaveColoredOBJ 函数
+    void SaveColoredOBJ(string filename, vector<Model> &parts, Params &params)
+    {       
+        // 创建对应的MTL文件名
+        string mtlname = filename.substr(0, filename.length()-4) + ".mtl";
+        string mtlbasename = mtlname.substr(mtlname.find_last_of("/\\") + 1);
+        // 输出文件保存位置
+        cout << "Saving colored OBJ file to: " << filename << " mtl file : " << mtlname << endl;
+        cout.flush(); 
+        
+        // 创建并写入MTL文件
+        ofstream mtlfile(mtlname);
+        if (!mtlfile) {
+            cerr << "Error: Could not create MTL file: " << mtlname << endl;
+            return; 
         }
-        for (int i = 0; i < (int)triangles.size(); ++i)
-        {
-            os << "f " << triangles[i][0] + 1 << " " << triangles[i][1] + 1 << " " << triangles[i][2] + 1 << "\n";
+        vector<string> material_names;
+        
+        // 为每个部分生成一个材质
+        for(size_t i = 0; i < parts.size(); i++) {  // 使用 size_t 而不是 int
+            string matname = "material" + to_string(i);
+            material_names.push_back(matname);
+            
+            float r, g, b;
+            GenerateRandomColor(r, g, b);
+            
+            mtlfile << "newmtl " << matname << endl;
+            mtlfile << "Ka " << r << " " << g << " " << b << endl;
+            mtlfile << "Kd " << r << " " << g << " " << b << endl;
+            mtlfile << "Ks 0.0 0.0 0.0" << endl;
+            mtlfile << "d 1.0" << endl;
+            mtlfile << "illum 1" << endl << endl;
         }
-        os.close();
+        mtlfile.close();
+
+        // 写入OBJ文件
+        ofstream outfile(filename);
+        outfile << "mtllib " << mtlbasename << endl;
+        
+        int vertex_offset = 1;
+        
+        for(size_t i = 0; i < parts.size(); i++) {  // 使用 size_t 而不是 int
+            // 使用该部分的材质
+            outfile << "usemtl " << material_names[i] << endl;
+            outfile << "o part_" << i << endl;
+            
+            // 写入顶点
+            for(size_t j = 0; j < parts[i].points.size(); j++) {
+                outfile << "v " << parts[i].points[j][0] << " " 
+                              << parts[i].points[j][1] << " "
+                              << parts[i].points[j][2] << endl;
+            }
+            
+            // 写入面
+            for(size_t j = 0; j < parts[i].triangles.size(); j++) {
+                outfile << "f ";
+                for(int k = 0; k < 3; k++) {
+                    outfile << (parts[i].triangles[j][k] + vertex_offset) << " ";
+                }
+                outfile << endl;
+            }
+            
+            vertex_offset += parts[i].points.size();
+        }
+        
+        outfile.close();
     }
 
     double MeshArea(Model &mesh)
@@ -725,5 +786,19 @@ namespace coacd
                 meshes[i].RevertPCA(rot);
             meshes[i].Recover(bbox);
         }
+    }
+
+    void Model::SaveOBJ(const string &filename)
+    {
+        std::ofstream os(filename);
+        for (int i = 0; i < (int)points.size(); ++i)
+        {
+            os << "v " << points[i][0] << " " << points[i][1] << " " << points[i][2] << "\n";
+        }
+        for (int i = 0; i < (int)triangles.size(); ++i)
+        {
+            os << "f " << triangles[i][0] + 1 << " " << triangles[i][1] + 1 << " " << triangles[i][2] + 1 << "\n";
+        }
+        os.close();
     }
 }

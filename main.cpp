@@ -191,7 +191,7 @@ int main(int argc, char *argv[])
   string wrlName = regex_replace(params.output_name, regex("obj"), "wrl");
 
   SaveVRML(wrlName, parts, params);
-  SaveOBJ(objName, parts, params);
+  SaveColoredOBJ(objName, parts, params);
 
   return 0;
 }
