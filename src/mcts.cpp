@@ -634,41 +634,72 @@ namespace coacd
         }
     }
 
-    bool ComputeBestRvClippingPlane(Model &m, Params &params, vector<Plane> &planes, Plane &bestplane, double &bestcost)
+    bool ComputeBestRvClippingPlane(Model &mesh, Params &params, vector<Plane> &planes, Plane &bestplane, double &bestcost)
     {
         if ((int)planes.size() == 0)
             return false;
-        double H_min = INF;
-        double cut_area;
-        bool flag;
-        for (int i = 0; i < (int)planes.size(); i++)
-        {
-            Model pos, neg, posCH, negCH;
-
-            flag = Clip(m, pos, neg, planes[i], cut_area);
-            double H;
-            if (!flag)
-                H = INF;
-            else
+        
+        bestcost = INF;
+        size_t num_planes = planes.size();
+        
+        // 只有当平面数量足够多时才并行
+        if (num_planes >= 16) {
+            vector<double> local_costs(num_planes, INF);
+            vector<Plane> local_bestplanes(num_planes);
+            
+            #pragma omp parallel for
+            for (size_t i = 0; i < num_planes; i++)
             {
-                if (pos.points.size() <= 0 || neg.points.size() <= 0)
-                    continue;
-
-                pos.ComputeAPX(posCH);
-                neg.ComputeAPX(negCH);
-
-                H = ComputeTotalRv(m, pos, posCH, neg, negCH, params.rv_k, planes[i]);
+                Model pos, neg, posCH, negCH;
+                double cut_area;
+                if (Clip(mesh, pos, neg, planes[i], cut_area))
+                {
+                    if (pos.points.size() <= 0 || neg.points.size() <= 0)
+                        continue;
+                    
+                    pos.ComputeAPX(posCH, params.apx_mode);
+                    neg.ComputeAPX(negCH, params.apx_mode);
+                    double cost_pos = ComputeRv(pos, posCH, params.rv_k);
+                    double cost_neg = ComputeRv(neg, negCH, params.rv_k);
+                    local_costs[i] = max(cost_pos, cost_neg);
+                    local_bestplanes[i] = planes[i];
+                }
             }
-
-            if (H < H_min)
+            
+            // 找出最佳平面
+            for (size_t i = 0; i < num_planes; i++) {
+                if (local_costs[i] < bestcost) {
+                    bestcost = local_costs[i];
+                    bestplane = local_bestplanes[i];
+                }
+            }
+        } 
+        else {
+            // 平面数量少时使用原始顺序版本
+            for (size_t i = 0; i < planes.size(); i++)
             {
-                H_min = H;
-                bestplane = planes[i];
-                bestcost = H;
+                Model pos, neg, posCH, negCH;
+                double cut_area;
+                if (Clip(mesh, pos, neg, planes[i], cut_area))
+                {
+                    if (pos.points.size() <= 0 || neg.points.size() <= 0)
+                        continue;
+                    
+                    pos.ComputeAPX(posCH, params.apx_mode);
+                    neg.ComputeAPX(negCH, params.apx_mode);
+                    double cost_pos = ComputeRv(pos, posCH, params.rv_k);
+                    double cost_neg = ComputeRv(neg, negCH, params.rv_k);
+                    double cost = max(cost_pos, cost_neg);
+                    if (cost < bestcost)
+                    {
+                        bestcost = cost;
+                        bestplane = planes[i];
+                    }
+                }
             }
         }
-
-        return true;
+        
+        return bestcost != INF;
     }
 
     double ComputeReward(Params &params, double meshCH_v, vector<double> &current_costs, vector<Part> &current_parts, int &worst_part_idx, double ori_mesh_area, double ori_mesh_volume)

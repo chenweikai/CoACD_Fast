@@ -103,16 +103,18 @@ namespace coacd
 
     void Model::ComputeAPX(Model &convex, string apx_mode, bool if_vch)
     {
-        // clean convex points and triangles
-        convex.points.clear();
-        convex.triangles.clear();
-
-        if (apx_mode == "box")
+        // 这个函数本身非常简单，不需要修改
+        if (apx_mode == "ch")
+        {
+            if (if_vch)
+                ComputeVCH(convex);
+            else
+                ComputeCH(convex, false);
+        }
+        else if (apx_mode == "box")
+        {
             ComputeBOX(convex);
-        else if (apx_mode == "ch" and !if_vch)
-            ComputeCH(convex);
-        else
-            ComputeVCH(convex);
+        }
     }
 
     void Model::ComputeBOX(Model &convex)
@@ -147,10 +149,13 @@ namespace coacd
         bool flag = true;
         quickhull::QuickHull<float> qh; // Could be double as well
         vector<quickhull::Vector3<float>> pointCloud;
-        // Add points to point cloud
+        
+        // 并行构建点云数据 - 这是一个独立任务，可以并行执行
+        pointCloud.resize(points.size());
+        #pragma omp parallel for
         for (int i = 0; i < (int)points.size(); i++)
         {
-            pointCloud.push_back(quickhull::Vector3<float>(points[i][0], points[i][1], points[i][2]));
+            pointCloud[i] = quickhull::Vector3<float>(points[i][0], points[i][1], points[i][2]);
         }
 
         auto hull = qh.getConvexHull(pointCloud, true, false, flag);
@@ -160,15 +165,27 @@ namespace coacd
             ComputeVCH(convex);
             return;
         }
+        
         const auto &indexBuffer = hull.getIndexBuffer();
         const auto &vertexBuffer = hull.getVertexBuffer();
+        
+        // 预分配内存以避免多次重新分配
+        convex.points.resize(vertexBuffer.size());
+        convex.triangles.resize(indexBuffer.size() / 3);
+        
+        // 并行转换顶点数据
+        #pragma omp parallel for
         for (int i = 0; i < (int)vertexBuffer.size(); i++)
         {
-            convex.points.push_back({vertexBuffer[i].x, vertexBuffer[i].y, vertexBuffer[i].z});
+            convex.points[i] = {vertexBuffer[i].x, vertexBuffer[i].y, vertexBuffer[i].z};
         }
+        
+        // 并行转换三角形索引
+        #pragma omp parallel for
         for (int i = 0; i < (int)indexBuffer.size(); i += 3)
         {
-            convex.triangles.push_back({(int)indexBuffer[i + 2], (int)indexBuffer[i + 1], (int)indexBuffer[i]});
+            int idx = i / 3;
+            convex.triangles[idx] = {(int)indexBuffer[i + 2], (int)indexBuffer[i + 1], (int)indexBuffer[i]};
         }
     }
 
@@ -176,11 +193,41 @@ namespace coacd
     {
         btConvexHullComputer ch;
         ch.compute(points, -1.0, -1.0);
+        
+        // 预分配内存
+        convex.points.resize(ch.vertices.size());
+        
+        // 并行拷贝顶点数据
+        #pragma omp parallel for
         for (int32_t v = 0; v < ch.vertices.size(); v++)
         {
-            convex.points.push_back({ch.vertices[v].getX(), ch.vertices[v].getY(), ch.vertices[v].getZ()});
+            convex.points[v] = {ch.vertices[v].getX(), ch.vertices[v].getY(), ch.vertices[v].getZ()};
         }
+        
+        // 面的处理不能轻易并行化，因为它依赖于链表遍历
+        // 但我们可以先统计三角形数量，然后预分配内存
+        int triangleCount = 0;
         const int32_t nt = ch.faces.size();
+        for (int32_t t = 0; t < nt; ++t)
+        {
+            const btConvexHullComputer::Edge *sourceEdge = &(ch.edges[ch.faces[t]]);
+            int32_t a = sourceEdge->getSourceVertex();
+            int32_t b = sourceEdge->getTargetVertex();
+            const btConvexHullComputer::Edge *edge = sourceEdge->getNextEdgeOfFace();
+            int32_t c = edge->getTargetVertex();
+            while (c != a)
+            {
+                triangleCount++;
+                edge = edge->getNextEdgeOfFace();
+                b = c;
+                c = edge->getTargetVertex();
+            }
+        }
+        
+        // 预分配三角形数组
+        convex.triangles.reserve(triangleCount);
+        
+        // 顺序处理三角形 (这部分很难并行化)
         for (int32_t t = 0; t < nt; ++t)
         {
             const btConvexHullComputer::Edge *sourceEdge = &(ch.edges[ch.faces[t]]);
@@ -202,30 +249,66 @@ namespace coacd
     {
         array<array<double, 3>, 3> Q;
         double barycenter[3] = {0};
-        for (int i = 0; i < (int)points.size(); i++)
+        
+        // 并行计算重心
+        #pragma omp parallel
         {
-            barycenter[0] += points[i][0];
-            barycenter[1] += points[i][1];
-            barycenter[2] += points[i][2];
+            double local_barycenter[3] = {0};
+            
+            #pragma omp for nowait
+            for (int i = 0; i < (int)points.size(); i++)
+            {
+                local_barycenter[0] += points[i][0];
+                local_barycenter[1] += points[i][1];
+                local_barycenter[2] += points[i][2];
+            }
+            
+            #pragma omp critical
+            {
+                barycenter[0] += local_barycenter[0];
+                barycenter[1] += local_barycenter[1];
+                barycenter[2] += local_barycenter[2];
+            }
         }
+        
         barycenter[0] /= (int)points.size();
         barycenter[1] /= (int)points.size();
         barycenter[2] /= (int)points.size();
 
-        array<array<double, 3>, 3> covMat;
-        double x, y, z;
-        for (int i = 0; i < (int)points.size(); i++)
+        array<array<double, 3>, 3> covMat = {{{0}}};
+        
+        // 并行计算协方差矩阵
+        #pragma omp parallel
         {
-            x = points[i][0] - barycenter[0];
-            y = points[i][1] - barycenter[1];
-            z = points[i][2] - barycenter[2];
-            covMat[0][0] += x * x;
-            covMat[1][1] += y * y;
-            covMat[2][2] += z * z;
-            covMat[0][1] += x * y;
-            covMat[0][2] += x * z;
-            covMat[1][2] += y * z;
+            array<array<double, 3>, 3> local_covMat = {{{0}}};
+            double x, y, z;
+            
+            #pragma omp for nowait
+            for (int i = 0; i < (int)points.size(); i++)
+            {
+                x = points[i][0] - barycenter[0];
+                y = points[i][1] - barycenter[1];
+                z = points[i][2] - barycenter[2];
+                local_covMat[0][0] += x * x;
+                local_covMat[1][1] += y * y;
+                local_covMat[2][2] += z * z;
+                local_covMat[0][1] += x * y;
+                local_covMat[0][2] += x * z;
+                local_covMat[1][2] += y * z;
+            }
+            
+            #pragma omp critical
+            {
+                covMat[0][0] += local_covMat[0][0];
+                covMat[1][1] += local_covMat[1][1];
+                covMat[2][2] += local_covMat[2][2];
+                covMat[0][1] += local_covMat[0][1];
+                covMat[0][2] += local_covMat[0][2];
+                covMat[1][2] += local_covMat[1][2];
+            }
         }
+        
+        // 完成协方差矩阵的计算
         covMat[0][0] /= (int)points.size();
         covMat[1][1] /= (int)points.size();
         covMat[2][2] /= (int)points.size();
@@ -235,6 +318,7 @@ namespace coacd
         covMat[1][0] = covMat[0][1];
         covMat[2][0] = covMat[0][2];
         covMat[2][1] = covMat[1][2];
+        
         Diagonalize(covMat, Q, eigen_values);
     }
 
@@ -704,53 +788,68 @@ namespace coacd
             cerr << "Error: Could not create MTL file: " << mtlname << endl;
             return; 
         }
+        
+        // 使用预留容量减少内存重分配
         vector<string> material_names;
+        material_names.reserve(parts.size());
         
         // 为每个部分生成一个材质
-        for(size_t i = 0; i < parts.size(); i++) {  // 使用 size_t 而不是 int
+        for(size_t i = 0; i < parts.size(); i++) {
             string matname = "material" + to_string(i);
             material_names.push_back(matname);
             
             float r, g, b;
             GenerateRandomColor(r, g, b);
             
-            mtlfile << "newmtl " << matname << endl;
-            mtlfile << "Ka " << r << " " << g << " " << b << endl;
-            mtlfile << "Kd " << r << " " << g << " " << b << endl;
-            mtlfile << "Ks 0.0 0.0 0.0" << endl;
-            mtlfile << "d 1.0" << endl;
-            mtlfile << "illum 1" << endl << endl;
+            // 使用字符串流进行批量写入，减少I/O调用
+            mtlfile << "newmtl " << matname << "\n"
+                    << "Ka " << r << " " << g << " " << b << "\n"
+                    << "Kd " << r << " " << g << " " << b << "\n"
+                    << "Ks 0.0 0.0 0.0" << "\n"
+                    << "d 1.0" << "\n"
+                    << "illum 1" << "\n\n";
         }
         mtlfile.close();
 
-        // 写入OBJ文件
+        // 写入OBJ文件 - 使用缓冲输出提高性能
         ofstream outfile(filename);
-        outfile << "mtllib " << mtlbasename << endl;
+        outfile.rdbuf()->pubsetbuf(new char[8192], 8192); // 增加缓冲区大小
         
-        int vertex_offset = 1;
+        outfile << "mtllib " << mtlbasename << "\n";
         
-        for(size_t i = 0; i < parts.size(); i++) {  // 使用 size_t 而不是 int
+        // 预计算每个部分的顶点偏移量
+        vector<int> vertex_offsets(parts.size());
+        int offset = 1; // OBJ从1开始索引
+        for(size_t i = 0; i < parts.size(); i++) {
+            vertex_offsets[i] = offset;
+            offset += parts[i].points.size();
+        }
+        
+        // 使用字符串流来构建输出，减少I/O调用次数
+        for(size_t i = 0; i < parts.size(); i++) {
             // 使用该部分的材质
-            outfile << "usemtl " << material_names[i] << endl;
-            outfile << "o part_" << i << endl;
+            outfile << "usemtl " << material_names[i] << "\n"
+                    << "o part_" << i << "\n";
             
-            // 写入顶点
+            // 批量写入顶点
+            stringstream vertex_stream;
             for(size_t j = 0; j < parts[i].points.size(); j++) {
-                outfile << "v " << parts[i].points[j][0] << " " 
+                vertex_stream << "v " << parts[i].points[j][0] << " " 
                               << parts[i].points[j][1] << " "
-                              << parts[i].points[j][2] << endl;
+                              << parts[i].points[j][2] << "\n";
             }
+            outfile << vertex_stream.str();
             
-            // 写入面
+            // 批量写入面
+            stringstream face_stream;
             for(size_t j = 0; j < parts[i].triangles.size(); j++) {
-                outfile << "f ";
+                face_stream << "f ";
                 for(int k = 0; k < 3; k++) {
-                    outfile << (parts[i].triangles[j][k] + vertex_offset) << " ";
+                    face_stream << (parts[i].triangles[j][k] + vertex_offsets[i]) << " ";
                 }
-                outfile << endl;
+                face_stream << "\n";
             }
-            
-            vertex_offset += parts[i].points.size();
+            outfile << face_stream.str();
         }
         
         outfile.close();

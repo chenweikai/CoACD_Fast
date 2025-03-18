@@ -513,6 +513,16 @@ namespace coacd
             tmp.clear();
             iter++;
         }
+
+        // 在调用MergeConvexHulls前输出当前已用时间
+#ifdef _OPENMP
+        double pre_merge_time = omp_get_wtime();
+        logger::info("Pre-Merge Processing Time: {}s", double(pre_merge_time - start));
+#else
+        clock_t pre_merge_time = clock();
+        logger::info("Pre-Merge Processing Time: {}s", double(pre_merge_time - start) / CLOCKS_PER_SEC);
+#endif
+
         if (params.merge)
             MergeConvexHulls(mesh, pmeshs, parts, params);
 
